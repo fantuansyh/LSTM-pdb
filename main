@@ -1,0 +1,178 @@
+import numpy as np
+from Bio import SeqIO
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+import numpy as np
+from Bio import SeqIO
+def one_hot_encoding(fasta_file):
+    sequences = []
+    for record in SeqIO.parse(fasta_file, "fasta"):
+        sequences.append(str(record.seq))
+
+    M = len(sequences)
+    max_length = 0
+    for seq in sequences:
+        N = len(seq)
+        if (N - 1) * 20 > max_length:
+            max_length = (N - 1) * 20
+
+    Data = np.zeros((M, max_length), dtype=int)
+    amino_acids = 'ACDEFGHIKLMNPQRSTVWY'
+
+    for j, seq in enumerate(sequences):
+        N = len(seq)
+        x = (N + 1) // 2
+        if N > 0:
+            seq = seq[:x - 1] + seq[x:]
+        N = len(seq)
+        encoded_seq = []
+
+        for aa in seq:
+            one_hot = [0] * 20
+            if aa in amino_acids:
+                one_hot[amino_acids.index(aa)] = 1
+            encoded_seq.extend(one_hot)
+
+        Data[j, :len(encoded_seq)] = encoded_seq
+
+    print("Final data shape:", Data.shape)
+    print("Sample encoded sequence:", Data[0])
+    return Data
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(LSTMModel, self).__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.fc1 = nn.Linear(hidden_dim, output_dim)
+        self.relu = nn.ReLU()
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, x):
+        _, (h_n, _) = self.lstm(x)  # LSTM output
+        x = self.relu(h_n.squeeze(0))  # Shape: [batch_size, hidden_dim]
+        x = self.fc1(x)  # Fully connected layer
+        print("Shape of x after fc1:", x.shape)  # Debugging
+        if x.dim() == 1:  # Check if x is 1D
+            x = x.unsqueeze(0)  # Add batch dimension if missing
+        return self.softmax(x)  # Apply softmax
+
+
+def pad_sequences(data, max_length):
+    # 使用np.pad函数填充数组至指定的最大长度
+    padding = max_length - data.shape[1]
+    if padding > 0:
+        data = np.pad(data, ((0, 0), (0, padding)), 'constant')
+    return data
+
+def prepare_data():
+    trainP = one_hot_encoding('train_label0.fasta')
+    trainPosmerge = one_hot_encoding('train_label1.fasta')
+    trainN = one_hot_encoding('train_label2.fasta')
+    testPos = one_hot_encoding('test_label0.fasta')
+    testNeg = one_hot_encoding('test_label1.fasta')
+    testAnother = one_hot_encoding('test_label2.fasta')
+
+    maxCols = max(trainP.shape[1], trainPosmerge.shape[1], trainN.shape[1], testPos.shape[1], testNeg.shape[1],
+                  testAnother.shape[1])
+    print(maxCols)
+    trainP_padded = pad_sequences(trainP, maxCols)
+    trainPosmerge_padded = pad_sequences(trainPosmerge, maxCols)
+    trainN_padded = pad_sequences(trainN, maxCols)
+    testPos_padded = pad_sequences(testPos, maxCols)
+    testNeg_padded = pad_sequences(testNeg, maxCols)
+    testAnother_padded = pad_sequences(testAnother, maxCols)
+    print(trainP_padded.shape)
+    print(trainPosmerge_padded.shape)
+    print(trainN_padded.shape)
+    P_train = np.vstack((trainP_padded, trainPosmerge_padded, trainN_padded))
+    T_train = np.hstack(
+        (np.zeros(trainP_padded.shape[0]), np.ones(trainPosmerge_padded.shape[0]), 2 * np.ones(trainN_padded.shape[0])))
+
+    P_test = np.vstack((testPos_padded, testNeg_padded, testAnother_padded))
+    T_test = np.hstack(
+        (np.zeros(testPos_padded.shape[0]), np.ones(testNeg_padded.shape[0]), 2 * np.ones(testAnother_padded.shape[0])))
+
+    scaler = MinMaxScaler()
+    P_train = scaler.fit_transform(P_train)
+    P_test = scaler.transform(P_test)
+
+    P_train = torch.tensor(P_train, dtype=torch.float32)
+    P_test = torch.tensor(P_test, dtype=torch.float32)
+    T_train = torch.tensor(T_train, dtype=torch.long)
+    T_test = torch.tensor(T_test, dtype=torch.long)
+    print(P_train.shape)
+    print(P_test.shape)
+    print(T_train.shape)
+    print(T_test.shape)
+    return P_train, T_train, P_test, T_test, maxCols
+
+
+def train_model(P_train, T_train, P_test, T_test, input_dim):
+    model = LSTMModel(input_dim, 9, 3).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+    train_dataset = TensorDataset(P_train, T_train)
+    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+
+    test_dataset = TensorDataset(P_test, T_test)
+    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+
+    for epoch in range(1000):
+        model.train()  # 确保模型在训练模式
+        for inputs, labels in train_loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+
+        if epoch % 100 == 0:  # 每100个周期评估一次
+            print(f'Epoch {epoch} evaluation:')
+            evaluate_model(model, test_loader, device)
+
+    print("Final evaluation after training:")
+    evaluate_model(model, test_loader, device)
+
+
+
+def evaluate_model(model, loader, device):
+    all_labels = []
+    all_preds = []
+
+    model.eval()  # 设置模型为评估模式
+    with torch.no_grad():
+        for inputs, labels in loader:
+            inputs = inputs.to(device)
+            labels = labels.to(device)
+            outputs = model(inputs)
+            _, preds = torch.max(outputs, 1)
+
+            all_labels.extend(labels.cpu().numpy())  # 收集所有真实标签
+            all_preds.extend(preds.cpu().numpy())  # 收集所有预测结果
+
+    # 计算指标
+    cm = confusion_matrix(all_labels, all_preds)
+    precision = precision_score(all_labels, all_preds, average='macro')  # 也可以使用其他 average 如 'micro', 'weighted'
+    recall = recall_score(all_labels, all_preds, average='macro')
+    f1 = f1_score(all_labels, all_preds, average='macro')
+
+    print("混淆矩阵:\n", cm)
+    print("精确度: {:.4f}".format(precision))
+    print("召回率: {:.4f}".format(recall))
+    print("F1得分: {:.4f}".format(f1))
+
+    return cm, precision, recall, f1
+
+
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+# 执行训练和评估
+P_train, T_train, P_test, T_test, input_dim = prepare_data()
+print(input_dim)
+train_model(P_train, T_train, P_test, T_test, input_dim)
